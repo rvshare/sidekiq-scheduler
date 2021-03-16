@@ -21,7 +21,7 @@ Gem::Specification.new do |s|
   s.add_dependency 'thwait'
   s.add_dependency 'e2mmap'
 
-  s.add_development_dependency 'rake',                    '~> 10.0'
+  s.add_development_dependency 'rake',                    '~> 13.0'
   s.add_development_dependency 'timecop',                 '~> 0'
   s.add_development_dependency 'mocha',                   '~> 0'
   s.add_development_dependency 'rspec'
