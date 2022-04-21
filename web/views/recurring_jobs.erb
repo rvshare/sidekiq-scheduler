@@ -21,6 +21,10 @@
         margin-bottom: 5px;
     }
 
+    .recurring-jobs .actions form {
+        display: inline-block
+    }
+
     .recurring-jobs .status, .recurring-jobs .description {
         font-size: 12px;
     }
@@ -69,6 +73,7 @@
               <%= csrf_tag %>
               <input type="submit" class="btn btn-warn btn-xs" value="<%= t('enqueue_now') %>" />
             </form>
+
             <form action="<%= root_path %>recurring-jobs/<%= ERB::Util.url_encode(job.name) %>/toggle" method="post">
               <%= csrf_tag %>
               <input type="submit" class="btn <%= job.enabled? ? "btn-primary" : "btn-warn"%> btn-xs" value="<%= job.enabled? ? t('disable') : t('enable') %>" />
