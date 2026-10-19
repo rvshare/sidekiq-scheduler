@@ -29,18 +29,52 @@ describe Sidekiq::Web do
   end
 
   before do
+    env 'rack.session', { csrf: File.read('spec/support/.session.key') }
+    env 'HTTP_X_CSRF_TOKEN', File.read('spec/support/.session.key')
+    # Sidekiq 8.1+ treats non-GET requests as unsafe unless this header is set (browser sends it
+    # automatically). Rack::Test does not, so POSTs would return 403 without it.
+    env 'HTTP_SEC_FETCH_SITE', 'same-origin'
+
     Sidekiq.redis(&:flushall)
     Sidekiq.schedule = jobs
+
+    if Gem::Version.new(Sidekiq::VERSION) >= Gem::Version.new('8.0.0')
+      Sidekiq::Web.configure do |c|
+        # Remove CSRF protection
+        if Gem::Version.new(Sidekiq::VERSION) >= Gem::Version.new('8.0.5')
+          # See: https://github.com/sidekiq/sidekiq/commit/01bc5c963d9927ff27c62b118196972486a8f9a4
+          c[:csrf] = false
+        else
+          # See: https://github.com/sidekiq/sidekiq/blob/0a1bce30e562357e0bb60ce84d78fe5d8446bed9/test/webext_test.rb#L37
+          c.middlewares.clear
+        end
+      end
+    end
+  end
+
+  describe 'GET /' do
+    subject { get '/' }
+
+    it { is_expected.to be_successful }
+
+    describe 'response body' do
+      subject do
+        get '/'
+        last_response.body
+      end
+
+      it 'shows the recurring jobs tab' do
+        is_expected.to match(/Recurring Jobs/)
+        is_expected.to match(%r{recurring-jobs})
+      end
+    end
   end
 
   describe 'GET /recurring-jobs' do
     subject { get '/recurring-jobs' }
 
     context 'when the next execution time is not setted' do
-      it do
-        pending 'due to failure in mock_redis when pipelining array replies'
-        is_expected.to be_successful
-      end
+      it { is_expected.to be_successful }
 
       describe 'response body' do
         subject do
@@ -49,7 +83,6 @@ describe Sidekiq::Web do
         end
 
         it 'shows schedule' do
-          pending 'due to failure in mock_redis when pipelining array replies'
           is_expected.to match(/Foo Job/)
           is_expected.to match(/FooClass/)
           is_expected.to match(/0 \* \* \* \* US\/Eastern/)
@@ -61,7 +94,7 @@ describe Sidekiq::Web do
           is_expected.to match(/BarClass/)
           is_expected.to match(/1h/)
           is_expected.to match(/special/)
-          is_expected.to match(/\[\"foo\", \"bar\"\]/)
+          is_expected.to match(/\["foo", "bar"\]/)
 
           is_expected.to match(/Enqueue now/)
         end
@@ -71,10 +104,7 @@ describe Sidekiq::Web do
     context 'when the next execution time is setted' do
       before { SidekiqScheduler::Utils.update_job_next_time(enabled_job_name, '2016-07-11T13:29:47Z') }
 
-      it do
-        pending 'due to failure in mock_redis when pipelining array replies'
-        is_expected.to be_successful
-      end
+      it { is_expected.to be_successful }
 
       describe 'response body' do
         subject do
@@ -82,20 +112,16 @@ describe Sidekiq::Web do
           last_response.body
         end
 
-        it do
-          pending 'due to failure in mock_redis when pipelining array replies'
-          is_expected.to match(/2016-07-11T13:29:47Z/)
-        end
+        it { is_expected.to match(/2016-07-11T13:29:47Z/) }
       end
     end
   end
 
   describe '/recurring-jobs/:name/toggle' do
-    subject { get "/recurring-jobs/#{URI.escape(enabled_job_name)}/toggle" }
+    subject { post "/recurring-jobs/#{ERB::Util.url_encode(enabled_job_name)}/toggle" }
 
     it 'toggles job enabled flag' do
-      expect { subject }
-        .to change { SidekiqScheduler::Scheduler.job_enabled?(enabled_job_name) }.from(true).to(false)
+      expect { subject }.to change { SidekiqScheduler::Scheduler.job_enabled?(enabled_job_name) }.from(true).to(false)
     end
 
     it 'reloads the schedule' do
@@ -106,7 +132,7 @@ describe Sidekiq::Web do
   end
 
   describe 'GET /recurring-jobs/:name/enqueue' do
-    subject { get "/recurring-jobs/#{URI.escape(job_name)}/enqueue" }
+    subject { post "/recurring-jobs/#{ERB::Util.url_encode(job_name)}/enqueue" }
 
     let(:job_name) { enabled_job_name }
     let(:job) { jobs[job_name] }
@@ -116,6 +142,30 @@ describe Sidekiq::Web do
     it 'enqueues particular job' do
       expect(SidekiqScheduler::Scheduler.instance).to receive(:enqueue_job).with(job)
       subject
+    end
+  end
+
+  describe '/recurring-jobs/toggle-all' do
+    context 'with «disable all» button' do
+      subject { post '/recurring-jobs/toggle-all', action: 'disable' }
+
+      it 'toggles jobs enabled flag to false' do
+        subject
+
+        expect(SidekiqScheduler::Scheduler.job_enabled?(enabled_job_name)).to be(false)
+        expect(SidekiqScheduler::Scheduler.job_enabled?(disabled_job_name)).to be(false)
+      end
+    end
+
+    context 'with «enable all» button' do
+      subject { post '/recurring-jobs/toggle-all', action: 'enable' }
+
+      it 'toggles jobs enabled flag to true' do
+        subject
+
+        expect(SidekiqScheduler::Scheduler.job_enabled?(enabled_job_name)).to be(true)
+        expect(SidekiqScheduler::Scheduler.job_enabled?(disabled_job_name)).to be(true)
+      end
     end
   end
 end

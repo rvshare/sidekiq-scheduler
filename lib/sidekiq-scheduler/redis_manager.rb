@@ -9,7 +9,7 @@ module SidekiqScheduler
     #
     # @return [String] schedule in JSON format
     def self.get_job_schedule(name)
-      hget(:schedules, name)
+      hget(schedules_key, name)
     end
 
     # Returns the state of a given job
@@ -39,12 +39,33 @@ module SidekiqScheduler
       hget(last_times_key, name)
     end
 
+    # Returns the state and execution times for the given jobs.
+    #
+    # @param [Array<String>] names job names
+    # @return [Hash] metadata keyed by job name
+    def self.get_jobs_metadata(names)
+      names = Array(names)
+      return {} if names.empty?
+
+      states, last_times, next_times = Sidekiq.redis do |redis|
+        redis.pipelined do |pipeline|
+          pipeline.hmget(schedules_state_key, *names)
+          pipeline.hmget(last_times_key, *names)
+          pipeline.hmget(next_times_key, *names)
+        end
+      end
+
+      names.each_with_index.to_h do |name, index|
+        [name, { state: states[index], last_time: last_times[index], next_time: next_times[index] }]
+      end
+    end
+
     # Sets the schedule for a given job
     #
     # @param [String] name The name of the job
     # @param [Hash] config The new schedule for the job
     def self.set_job_schedule(name, config)
-      hset(:schedules, name, JSON.generate(config))
+      hset(schedules_key, name, JSON.generate(config))
     end
 
     # Sets the state for a given job
@@ -55,12 +76,19 @@ module SidekiqScheduler
       hset(schedules_state_key, name, JSON.generate(state))
     end
 
+    # Removes the state for a given job
+    #
+    # @param [String] name The name of the job
+    def self.remove_job_state(name)
+      hdel(schedules_state_key, name)
+    end
+
     # Sets the next execution time for a given job
     #
     # @param [String] name The name of the job
     # @param [String] next_time The next time the job has to be executed
     def self.set_job_next_time(name, next_time)
-      hset(next_times_key, name, next_time)
+      hset(next_times_key, name, String(next_time))
     end
 
     # Sets the last execution time for a given job
@@ -68,14 +96,14 @@ module SidekiqScheduler
     # @param [String] name The name of the job
     # @param [String] last_time The last time the job was executed
     def self.set_job_last_time(name, last_time)
-      hset(last_times_key, name, last_time)
+      hset(last_times_key, name, String(last_time))
     end
 
     # Removes the schedule for a given job
     #
     # @param [String] name The name of the job
     def self.remove_job_schedule(name)
-      hdel(:schedules, name)
+      hdel(schedules_key, name)
     end
 
     # Removes the next execution time for a given job
@@ -89,14 +117,14 @@ module SidekiqScheduler
     #
     # @return [Hash] hash with all the job schedules
     def self.get_all_schedules
-      Sidekiq.redis { |r| r.hgetall(:schedules) }
+      Sidekiq.redis { |r| r.hgetall(schedules_key) }
     end
 
     # Returns boolean value that indicates if the schedules value exists
     #
     # @return [Boolean] true if the schedules key is set, false otherwise
     def self.schedule_exist?
-      Sidekiq.redis { |r| r.exists(:schedules) }
+      SidekiqScheduler::SidekiqAdapter.redis_key_exists?(schedules_key)
     end
 
     # Returns all the schedule changes for a given time range.
@@ -106,22 +134,22 @@ module SidekiqScheduler
     #
     # @return [Array] array with all the changed job names
     def self.get_schedule_changes(from, to)
-      Sidekiq.redis { |r| r.zrangebyscore(:schedules_changed, from, "(#{to}") }
+      SidekiqScheduler::SidekiqAdapter.redis_zrangebyscore(schedules_changed_key, from, "(#{to}")
     end
 
     # Register a schedule change for a given job
     #
     # @param [String] name The name of the job
     def self.add_schedule_change(name)
-      Sidekiq.redis { |r| r.zadd(:schedules_changed, Time.now.to_f, name) }
+      Sidekiq.redis { |r| r.zadd(schedules_changed_key, Time.now.to_f, name) }
     end
 
     # Remove all the schedule changes records
     def self.clean_schedules_changed
-      Sidekiq.redis { |r| r.del(:schedules_changed) unless r.type(:schedules_changed) == 'zset' }
+      Sidekiq.redis { |r| r.del(schedules_changed_key) unless r.type(schedules_changed_key) == 'zset' }
     end
 
-    # Removes a queued job instance
+    # Registers a queued job instance
     #
     # @param [String] job_name The name of the job
     # @param [Time] time The time at which the job was cleared by the scheduler
@@ -130,13 +158,13 @@ module SidekiqScheduler
     def self.register_job_instance(job_name, time)
       job_key = pushed_job_key(job_name)
       registered, _ = Sidekiq.redis do |r|
-        r.pipelined do
-          r.zadd(job_key, time.to_i, time.to_i)
-          r.expire(job_key, REGISTERED_JOBS_THRESHOLD_IN_SECONDS)
+        r.multi do |m|
+          m.zadd(job_key, time.to_i, time.to_i)
+          m.expire(job_key, REGISTERED_JOBS_THRESHOLD_IN_SECONDS)
         end
       end
 
-      registered
+      registered.instance_of?(Integer) ? (registered > 0) : registered
     end
 
     # Removes instances of the job older than 24 hours
@@ -156,28 +184,57 @@ module SidekiqScheduler
     #
     # @return [String] the pushed job key
     def self.pushed_job_key(job_name)
-      "sidekiq-scheduler:pushed:#{job_name}"
+      "#{key_prefix}sidekiq-scheduler:pushed:#{job_name}"
     end
 
     # Returns the key of the Redis hash for job's execution times hash
     #
     # @return [String] with the key
     def self.next_times_key
-      'sidekiq-scheduler:next_times'
+      "#{key_prefix}sidekiq-scheduler:next_times"
     end
 
     # Returns the key of the Redis hash for job's last execution times hash
     #
     # @return [String] with the key
     def self.last_times_key
-      'sidekiq-scheduler:last_times'
+      "#{key_prefix}sidekiq-scheduler:last_times"
     end
 
     # Returns the Redis's key for saving schedule states.
     #
     # @return [String] with the key
     def self.schedules_state_key
-      'sidekiq-scheduler:states'
+      "#{key_prefix}sidekiq-scheduler:states"
+    end
+
+    # Returns the Redis's key for saving schedules.
+    #
+    # @return [String] with the key
+    def self.schedules_key
+      "#{key_prefix}schedules"
+    end
+
+    # Returns the Redis's key for saving schedule changes.
+    #
+    # @return [String] with the key
+    def self.schedules_changed_key
+      "#{key_prefix}schedules_changed"
+    end
+
+    # Returns the key prefix used to generate all scheduler keys
+    #
+    # @return [String] with the key prefix
+    def self.key_prefix
+      @key_prefix
+    end
+
+    # Sets the key prefix used to scope all scheduler keys
+    #
+    # @param [String] value The string to use as the prefix. A ":" will be appended as a delimiter if needed.
+    def self.key_prefix=(value)
+      value = "#{value}:" if value && !%w[. :].include?(value[-1])
+      @key_prefix = value
     end
 
     private

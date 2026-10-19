@@ -7,7 +7,11 @@ describe SidekiqScheduler::Schedule do
     let(:job_id) { 'super_job' }
     let(:schedule) { ScheduleFaker.default_options }
 
-    before { SidekiqScheduler::Scheduler.dynamic = true }
+    before do
+      @original_dynamic, SidekiqScheduler::Scheduler.dynamic = SidekiqScheduler::Scheduler.dynamic, true
+    end
+
+    after { SidekiqScheduler::Scheduler.dynamic = @original_dynamic }
 
     it 'sets the schedule on redis' do
       subject
@@ -65,6 +69,17 @@ describe SidekiqScheduler::Schedule do
         subject
 
         expect(SidekiqScheduler::Store.job_from_redis(job_id)['queue']).to eq('system')
+      end
+    end
+
+    context 'when job is an ActiveJob job' do
+      let(:job_id) { 'email_sender' }
+      let(:schedule) { { 'class' => 'EmailSender' } }
+
+      it 'does not set the queue name' do
+        subject
+
+        expect(SidekiqScheduler::Store.job_from_redis(job_id)['queue']).to eq(nil)
       end
     end
   end

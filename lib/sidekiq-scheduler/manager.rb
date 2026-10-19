@@ -1,7 +1,3 @@
-require 'redis'
-
-require 'sidekiq/util'
-
 require 'sidekiq-scheduler/schedule'
 require 'sidekiq-scheduler/scheduler'
 
@@ -12,50 +8,54 @@ module SidekiqScheduler
   # from Redis onto the work queues
   #
   class Manager
-    include Sidekiq::Util
+    def initialize(config)
+      set_current_scheduler_options(config)
 
-    DEFAULT_SCHEDULER_OPTIONS = {
-      enabled: true,
-      dynamic: false,
-      dynamic_every: '5s',
-      schedule: {}
-    }
-
-    def initialize(options)
-      scheduler_options = load_scheduler_options(options)
-
-      @scheduler_instance = SidekiqScheduler::Scheduler.new(scheduler_options)
+      @scheduler_instance = SidekiqScheduler::Scheduler.new(config)
       SidekiqScheduler::Scheduler.instance = @scheduler_instance
-      Sidekiq.schedule = scheduler_options[:schedule] if @scheduler_instance.enabled
+      return unless @scheduler_instance.enabled
+
+      # In `dynamic` mode runtime schedules only live in redis, so merge instead of
+      # replacing, which would remove them on every boot.
+      if @scheduler_instance.dynamic
+        Sidekiq.merge_schedule(config.schedule)
+      else
+        Sidekiq.schedule = config.schedule
+      end
     end
 
     def stop
-      @scheduler_instance.clear_schedule!
+      @scheduler_instance.clear_schedule!(restart: false)
     end
 
     def start
       @scheduler_instance.load_schedule!
     end
 
-    def reset
-      clear_scheduled_work
+    # This method is needed to avoid exposing unnecessary information.
+    # Because ActiveSupport's `as_json` traverses instance values to convert the object to a hash
+    # unless it responds to `to_hash`.
+    def to_hash
+      {
+        scheduler: @scheduler_instance.to_hash
+      }
     end
 
     private
 
-    def load_scheduler_options(options)
-      options[:listened_queues_only] = options.fetch(:scheduler, {})[:listened_queues_only]
-      scheduler_options = DEFAULT_SCHEDULER_OPTIONS.merge(options)
+    def set_current_scheduler_options(config)
+      enabled = SidekiqScheduler::Scheduler.enabled
+      dynamic = SidekiqScheduler::Scheduler.dynamic
+      dynamic_every = SidekiqScheduler::Scheduler.dynamic_every
+      listened_queues_only = SidekiqScheduler::Scheduler.listened_queues_only
 
-      current_options = {
-        enabled: SidekiqScheduler::Scheduler.enabled,
-        dynamic: SidekiqScheduler::Scheduler.dynamic,
-        dynamic_every: SidekiqScheduler::Scheduler.dynamic_every,
-        schedule: Sidekiq.schedule,
-        listened_queues_only: SidekiqScheduler::Scheduler.listened_queues_only
-      }.delete_if { |_, value| value.nil? }
-
-      scheduler_options.merge(current_options)
+      config.enabled = enabled unless enabled.nil?
+      config.dynamic = dynamic unless dynamic.nil?
+      config.dynamic_every = dynamic_every unless dynamic_every.nil?
+      unless Sidekiq.schedule.nil? || (Sidekiq.schedule.respond_to?(:empty?) && Sidekiq.schedule.empty?)
+        config.schedule = Sidekiq.schedule
+      end
+      config.listened_queues_only = listened_queues_only unless listened_queues_only.nil?
     end
   end
 end

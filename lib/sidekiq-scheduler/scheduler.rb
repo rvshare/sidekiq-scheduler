@@ -1,19 +1,24 @@
 require 'rufus/scheduler'
-require 'thwait'
-require 'sidekiq/util'
 require 'json'
-require 'sidekiq-scheduler/manager'
 require 'sidekiq-scheduler/rufus_utils'
 require 'sidekiq-scheduler/redis_manager'
+require 'sidekiq-scheduler/config'
 
 module SidekiqScheduler
   class Scheduler
-    extend Sidekiq::Util
-
     # We expect rufus jobs to have #params
     Rufus::Scheduler::Job.module_eval do
       alias_method :params, :opts
     end
+
+    # TODO: Can we remove those attr_accessor's? If we need to keep them, we should
+    # update those values on the config object instead of just here in the scheduler.
+    # That's why we need to do what we do in the set_current_scheduler_options (not
+    # saying we will have to do it somehow still)
+    #
+    # NOTE: ^ Keeping this TODO here for now, in a future version of this project
+    # we will remove those attr accessors and use only our config object. For now,
+    # let's keep as it is.
 
     # Set to enable or disable the scheduler.
     attr_accessor :enabled
@@ -26,6 +31,9 @@ module SidekiqScheduler
 
     # Set to schedule jobs only when will be pushed to queues listened by sidekiq
     attr_accessor :listened_queues_only
+
+    # Set custom options for rufus scheduler, like max_work_threads.
+    attr_accessor :rufus_scheduler_options
 
     class << self
 
@@ -43,11 +51,14 @@ module SidekiqScheduler
       end
     end
 
-    def initialize(options = {})
-      self.enabled = options[:enabled]
-      self.dynamic = options[:dynamic]
-      self.dynamic_every = options[:dynamic_every]
-      self.listened_queues_only = options[:listened_queues_only]
+    def initialize(config = SidekiqScheduler::Config.new(without_defaults: true))
+      @scheduler_config = config
+
+      self.enabled = config.enabled?
+      self.dynamic = config.dynamic?
+      self.dynamic_every = config.dynamic_every?
+      self.listened_queues_only = config.listened_queues_only?
+      self.rufus_scheduler_options = config.rufus_scheduler_options || {}
     end
 
     # the Rufus::Scheduler jobs that are scheduled
@@ -58,9 +69,9 @@ module SidekiqScheduler
     def print_schedule
       if rufus_scheduler
         Sidekiq.logger.info "Scheduling Info\tLast Run"
-        scheduler_jobs = rufus_scheduler.all_jobs
-        scheduler_jobs.each_value do |v|
-          Sidekiq.logger.info "#{v.t}\t#{v.last}\t"
+        scheduler_jobs = rufus_scheduler.jobs
+        scheduler_jobs.each do |job|
+          Sidekiq.logger.info "#{job.original}\t#{job.last_time}\t"
         end
       end
     end
@@ -83,14 +94,10 @@ module SidekiqScheduler
         Sidekiq.logger.info 'Schedule empty! Set Sidekiq.schedule' if Sidekiq.schedule.empty?
 
         @scheduled_jobs = {}
-        queues = sidekiq_queues
+        queues = scheduler_config.sidekiq_queues
 
         Sidekiq.schedule.each do |name, config|
-          if !listened_queues_only || enabled_queue?(config['queue'].to_s, queues)
-            load_schedule_job(name, config)
-          else
-            Sidekiq.logger.info { "Ignoring #{name}, job's queue is not enabled." }
-          end
+          load_schedule_job_for_queues(name, config, queues)
         end
 
         Sidekiq.logger.info 'Schedules Loaded'
@@ -117,6 +124,8 @@ module SidekiqScheduler
             schedule, options = SidekiqScheduler::RufusUtils.normalize_schedule_options(config_interval_type)
 
             rufus_job = new_job(name, interval_type, config, schedule, options)
+            return unless rufus_job
+
             @scheduled_jobs[name] = rufus_job
             SidekiqScheduler::Utils.update_job_next_time(name, rufus_job.next_time)
 
@@ -159,41 +168,34 @@ module SidekiqScheduler
       config = prepare_arguments(job_config.dup)
 
       if config.delete('include_metadata')
-        config['args'] = arguments_with_metadata(config['args'], scheduled_at: time.to_f)
+        config['args'] = arguments_with_metadata(config['args'], "scheduled_at" => time.to_f.round(3))
       end
 
-      if active_job_enqueue?(config['class'])
+      if SidekiqScheduler::Utils.active_job_enqueue?(config['class'])
         SidekiqScheduler::Utils.enqueue_with_active_job(config)
       else
         SidekiqScheduler::Utils.enqueue_with_sidekiq(config)
       end
     end
 
-    def rufus_scheduler_options
-      @rufus_scheduler_options ||= {}
-    end
-
-    def rufus_scheduler_options=(options)
-      @rufus_scheduler_options = options
-    end
-
     def rufus_scheduler
       @rufus_scheduler ||= SidekiqScheduler::Utils.new_rufus_scheduler(rufus_scheduler_options)
     end
 
-    # Stops old rufus scheduler and creates a new one.  Returns the new
-    # rufus scheduler
+    # Stops old rufus scheduler and optionally creates a new one. Returns the new
+    # rufus scheduler when restarting.
     #
     # @param [Symbol] stop_option The option to be passed to Rufus::Scheduler#stop
-    def clear_schedule!(stop_option = :wait)
+    # @param [Boolean] restart Whether to create a new scheduler after stopping
+    def clear_schedule!(stop_option = :wait, restart: true)
       if @rufus_scheduler
         @rufus_scheduler.stop(stop_option)
         @rufus_scheduler = nil
       end
 
-      @@scheduled_jobs = {}
+      @scheduled_jobs = {}
 
-      rufus_scheduler
+      rufus_scheduler if restart
     end
 
     def reload_schedule!
@@ -207,23 +209,26 @@ module SidekiqScheduler
     end
 
     def update_schedule
-      last_changed_score, @current_changed_score = @current_changed_score, Time.now.to_f
-      schedule_changes = SidekiqScheduler::RedisManager.get_schedule_changes(last_changed_score, @current_changed_score)
+      current_changed_score = Time.now.to_f
+      schedule_changes = SidekiqScheduler::RedisManager.get_schedule_changes(@current_changed_score, current_changed_score)
 
       if schedule_changes.size > 0
         Sidekiq.logger.info 'Updating schedule'
 
         Sidekiq.reload_schedule!
+        queues = scheduler_config.sidekiq_queues
         schedule_changes.each do |schedule_name|
-          if Sidekiq.schedule.keys.include?(schedule_name)
+          if Sidekiq.schedule.key?(schedule_name)
             unschedule_job(schedule_name)
-            load_schedule_job(schedule_name, Sidekiq.schedule[schedule_name])
+            load_schedule_job_for_queues(schedule_name, Sidekiq.schedule[schedule_name], queues)
           else
             unschedule_job(schedule_name)
           end
         end
         Sidekiq.logger.info 'Schedule updated'
       end
+
+      @current_changed_score = current_changed_score
     end
 
     def job_enabled?(name)
@@ -237,13 +242,49 @@ module SidekiqScheduler
       set_schedule_state(name, state)
     end
 
+    def toggle_all_jobs(new_state)
+      Sidekiq.schedule!.keys.each do |name|
+        state = schedule_state(name)
+        state['enabled'] = new_state
+        set_schedule_state(name, state)
+      end
+    end
+
+    def to_hash
+      {
+        scheduler_config: @scheduler_config.to_hash
+      }
+    end
+
+    def inspect
+      "#<SidekiqScheduler::Scheduler enabled=#{enabled} dynamic=#{dynamic} dynamic_every=#{dynamic_every} listened_queues_only=#{listened_queues_only} rufus_scheduler_options=#{rufus_scheduler_options}>"
+    end
+
     private
+
+    attr_reader :scheduler_config
+
+    def load_schedule_job_for_queues(name, config, queues)
+      if !listened_queues_only || enabled_queue?(config['queue'].to_s, queues)
+        load_schedule_job(name, config)
+      else
+        Sidekiq.logger.info { "Ignoring #{name}, job's queue is not enabled." }
+      end
+    end
 
     def new_job(name, interval_type, config, schedule, options)
       options = options.merge({ :job => true, :tags => [name] })
 
       rufus_scheduler.send(interval_type, schedule, options) do |job, time|
-        idempotent_job_enqueue(name, time, SidekiqScheduler::Utils.sanitize_job_config(config)) if job_enabled?(name)
+        if job_enabled?(name)
+          conf = SidekiqScheduler::Utils.sanitize_job_config(config)
+
+          if job.is_a?(Rufus::Scheduler::CronJob)
+            idempotent_job_enqueue(name, SidekiqScheduler::Utils.calc_cron_run_time(job.cron_line, time.to_t), conf)
+          else
+            idempotent_job_enqueue(name, time.to_t, conf)
+          end
+        end
       end
     end
 
@@ -268,18 +309,18 @@ module SidekiqScheduler
     # Saves a schedule state
     #
     # @param name [String] with the schedule's name
-    # @param name [Hash] with the schedule's state
+    # @param state [Hash] with the schedule's state
     def set_schedule_state(name, state)
       SidekiqScheduler::RedisManager.set_job_state(name, state)
     end
 
     # Adds a Hash with schedule metadata as the last argument to call the worker.
-    # It currently returns the schedule time as a Float number representing the milisencods
+    # It currently returns the schedule time as a Float number representing the milliseconds
     # since epoch.
     #
     # @example with hash argument
-    #   arguments_with_metadata({value: 1}, scheduled_at: Time.now)
-    #   #=> [{value: 1}, {scheduled_at: <miliseconds since epoch>}]
+    #   arguments_with_metadata({value: 1}, scheduled_at: Time.now.round(3))
+    #   #=> [{value: 1}, {scheduled_at: <milliseconds since epoch>}]
     #
     # @param args [Array|Hash]
     # @param metadata [Hash]
@@ -290,10 +331,6 @@ module SidekiqScheduler
       else
         [args, metadata]
       end
-    end
-
-    def sidekiq_queues
-      Sidekiq.options[:queues].map(&:to_s)
     end
 
     # Returns true if a job's queue is included in the array of queues
@@ -308,17 +345,6 @@ module SidekiqScheduler
       queues.empty? || queues.include?(job_queue)
     end
 
-    # Returns true if the enqueuing needs to be done for an ActiveJob
-    #  class false otherwise.
-    #
-    # @param [Class] klass the class to check is decendant from ActiveJob
-    #
-    # @return [Boolean]
-    def active_job_enqueue?(klass)
-      klass.is_a?(Class) && defined?(ActiveJob::Enqueuing) &&
-        klass.included_modules.include?(ActiveJob::Enqueuing)
-    end
-
     # Convert the given arguments in the format expected to be enqueued.
     #
     # @param [Hash] config the options to be converted
@@ -330,11 +356,7 @@ module SidekiqScheduler
     def prepare_arguments(config)
       config['class'] = SidekiqScheduler::Utils.try_to_constantize(config['class'])
 
-      if config['args'].is_a?(Hash)
-        config['args'].symbolize_keys! if config['args'].respond_to?(:symbolize_keys!)
-      else
-        config['args'] = Array(config['args'])
-      end
+      config['args'] = Array(config['args']) unless config['args'].is_a?(Hash)
 
       config
     end

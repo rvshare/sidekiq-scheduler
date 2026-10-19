@@ -53,6 +53,19 @@ module SidekiqScheduler
       @schedule = schedule_hash
     end
 
+    # Merges the given schedule into the one stored in redis.
+    #
+    # Unlike `schedule=`, the schedules that are missing from the given hash are
+    # left untouched, so a schedule defined in the configuration file can be loaded
+    # in `dynamic` mode without discarding the ones added at runtime.
+    def merge_schedule(schedule_hash)
+      prepare_schedule(schedule_hash).each do |name, job_spec|
+        set_schedule(name, job_spec)
+      end
+
+      reload_schedule!
+    end
+
     def schedule
       @schedule
     end
@@ -65,7 +78,7 @@ module SidekiqScheduler
     end
     alias_method :schedule!, :reload_schedule!
 
-    # Retrive the schedule configuration for the given name
+    # Retrieve the schedule configuration for the given name
     # if the name is nil it returns a hash with all the
     # names end their schedules.
     def get_schedule(name = nil)
@@ -113,6 +126,7 @@ module SidekiqScheduler
     # remove a given schedule by name
     def remove_schedule(name)
       SidekiqScheduler::RedisManager.remove_job_schedule(name)
+      SidekiqScheduler::RedisManager.remove_job_state(name)
       SidekiqScheduler::RedisManager.add_schedule_change(name)
     end
 
@@ -140,15 +154,15 @@ module SidekiqScheduler
     def infer_queue(klass)
       klass = try_to_constantize(klass)
 
-      if klass.respond_to?(:sidekiq_options)
+      # ActiveJob uses queue_as when the job is created
+      # to determine the queue
+      if klass.respond_to?(:sidekiq_options) && !SidekiqScheduler::Utils.active_job_enqueue?(klass)
         klass.sidekiq_options['queue']
       end
     end
 
     def try_to_constantize(klass)
-      klass.is_a?(String) ? klass.constantize : klass
-    rescue NameError
-      klass
+      SidekiqScheduler::Utils.try_to_constantize(klass)
     end
   end
 end
